@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    cmp::min,
+    cmp::{max, min},
     fs::File,
     io::{self, BufWriter, Seek, Write},
     path::Path,
@@ -29,9 +29,9 @@ const MAX_SMALL_VALUE_BLOCK_SIZE: usize = 16 * 1024;
 /// The aimed false positive rate for the AQMF
 const AQMF_FALSE_POSITIVE_RATE: f64 = 0.01;
 
-/// The maximum compression dictionay size for value blocks
+/// The maximum compression dictionary size for value blocks
 const VALUE_COMPRESSION_DICTIONARY_SIZE: usize = 64 * 1024 - 1;
-/// The maximum compression dictionay size for key and index blocks
+/// The maximum compression dictionary size for key and index blocks
 const KEY_COMPRESSION_DICTIONARY_SIZE: usize = 64 * 1024 - 1;
 /// The maximum bytes that should be selected as value samples to create a compression dictionary
 const VALUE_COMPRESSION_SAMPLES_SIZE: usize = 256 * 1024;
@@ -45,6 +45,8 @@ const MIN_VALUE_COMPRESSION_SAMPLES_SIZE: usize = 1024;
 const MIN_KEY_COMPRESSION_SAMPLES_SIZE: usize = 1024;
 /// The bytes that are used per key/value entry for a sample.
 const COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY: usize = 100;
+/// The minimum bytes that are used per key/value entry for a sample.
+const MIN_COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY: usize = 16;
 
 /// Trait for entries from that SST files can be created
 pub trait Entry {
@@ -153,66 +155,39 @@ impl<'a> StaticSortedFileBuilder<'a> {
         {
             return Ok(());
         }
-        let key_compression_samples_size = min(KEY_COMPRESSION_SAMPLES_SIZE, total_key_size / 10);
+        let key_compression_samples_size = min(KEY_COMPRESSION_SAMPLES_SIZE, total_key_size / 16);
         let value_compression_samples_size =
-            min(VALUE_COMPRESSION_SAMPLES_SIZE, total_value_size / 10);
+            min(VALUE_COMPRESSION_SAMPLES_SIZE, total_value_size / 16);
         let mut value_samples = Vec::with_capacity(value_compression_samples_size);
         let mut value_sample_sizes = Vec::new();
         let mut key_samples = Vec::with_capacity(key_compression_samples_size);
         let mut key_sample_sizes = Vec::new();
-        let mut i = 12345678 % entries.len();
-        let mut j = 0;
-        loop {
-            let entry = &entries[i];
-            let value_remaining = value_compression_samples_size - value_samples.len();
-            let key_remaining = key_compression_samples_size - key_samples.len();
-            if value_remaining > 0
-                && let EntryValue::Small { value } | EntryValue::Medium { value } = entry.value()
-            {
-                let value = if value.len() <= COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY {
-                    value
-                } else {
-                    j = (j + 12345678) % (value.len() - COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY);
-                    &value[j..j + COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY]
-                };
-                if value.len() <= value_remaining {
-                    value_sample_sizes.push(value.len());
-                    value_samples.extend_from_slice(value);
-                } else {
-                    value_sample_sizes.push(value_remaining);
-                    value_samples.extend_from_slice(&value[..value_remaining]);
-                }
-            }
-            if key_remaining > 0 {
-                let used_len = min(key_remaining, COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY);
-                if entry.key_len() <= used_len {
-                    key_sample_sizes.push(entry.key_len());
-                    entry.write_key_to(&mut key_samples);
-                } else {
-                    let mut temp = Vec::with_capacity(entry.key_len());
-                    entry.write_key_to(&mut temp);
-                    debug_assert!(temp.len() == entry.key_len());
 
-                    j = (j + 12345678) % (temp.len() - used_len);
-                    key_sample_sizes.push(used_len);
-                    key_samples.extend_from_slice(&temp[j..j + used_len]);
-                }
-            }
-            if key_remaining == 0 && value_remaining == 0 {
+        // Limit the number of iterations to avoid infinite loops
+        let max_iterations =
+            max(total_key_size, total_value_size) / COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY * 2;
+        for i in 0..max_iterations {
+            let entry = &entries[i % entries.len()];
+            let value_remaining = value_compression_samples_size - value_samples.len();
+            if value_remaining < MIN_COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY {
                 break;
             }
-            i = (i + 12345678) % entries.len();
+            if let EntryValue::Small { value } | EntryValue::Medium { value } = entry.value() {
+                let len = value.len();
+                if len >= MIN_COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY {
+                    let used_len = min(value_remaining, COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY);
+                    if len <= used_len {
+                        value_sample_sizes.push(len);
+                        value_samples.extend_from_slice(value);
+                    } else {
+                        value_sample_sizes.push(used_len);
+                        let p = value_samples.len() % (len - used_len);
+                        value_samples.extend_from_slice(&value[p..p + used_len]);
+                    };
+                }
+            }
         }
-        assert!(key_samples.len() == key_sample_sizes.iter().sum::<usize>());
         assert!(value_samples.len() == value_sample_sizes.iter().sum::<usize>());
-        if key_samples.len() > MIN_KEY_COMPRESSION_SAMPLES_SIZE && key_sample_sizes.len() > 5 {
-            self.key_compression_dictionary = zstd::dict::from_continuous(
-                &key_samples,
-                &key_sample_sizes,
-                KEY_COMPRESSION_DICTIONARY_SIZE,
-            )
-            .context("Key dictionary creation failed")?;
-        }
         if value_samples.len() > MIN_VALUE_COMPRESSION_SAMPLES_SIZE && value_sample_sizes.len() > 5
         {
             self.value_compression_dictionary = zstd::dict::from_continuous(
@@ -221,6 +196,41 @@ impl<'a> StaticSortedFileBuilder<'a> {
                 VALUE_COMPRESSION_DICTIONARY_SIZE,
             )
             .context("Value dictionary creation failed")?;
+        } else {
+            self.value_compression_dictionary = Vec::new();
+        }
+
+        for i in 0..max_iterations {
+            let entry = &entries[i % entries.len()];
+            let key_remaining = key_compression_samples_size - key_samples.len();
+            if key_remaining < MIN_COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY {
+                break;
+            }
+            let len = entry.key_len();
+            if len >= MIN_COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY {
+                let used_len = min(key_remaining, COMPRESSION_DICTIONARY_SAMPLE_PER_ENTRY);
+                if len <= used_len {
+                    key_sample_sizes.push(len);
+                    entry.write_key_to(&mut key_samples);
+                } else {
+                    let mut temp = Vec::with_capacity(len);
+                    entry.write_key_to(&mut temp);
+                    debug_assert!(temp.len() == len);
+
+                    let p = key_samples.len() % (len - used_len);
+                    key_sample_sizes.push(used_len);
+                    key_samples.extend_from_slice(&temp[p..p + used_len]);
+                }
+            }
+        }
+        assert!(key_samples.len() == key_sample_sizes.iter().sum::<usize>());
+        if key_samples.len() > MIN_KEY_COMPRESSION_SAMPLES_SIZE && key_sample_sizes.len() > 5 {
+            self.key_compression_dictionary = zstd::dict::from_continuous(
+                &key_samples,
+                &key_sample_sizes,
+                KEY_COMPRESSION_DICTIONARY_SIZE,
+            )
+            .context("Key dictionary creation failed")?;
         }
         Ok(())
     }
@@ -237,7 +247,7 @@ impl<'a> StaticSortedFileBuilder<'a> {
         // Last block is Index block
 
         // Store the locations of the values
-        let mut value_locations: Vec<(usize, usize)> = Vec::with_capacity(entries.len());
+        let mut value_locations: Vec<(u16, u32)> = Vec::with_capacity(entries.len());
 
         // Split the values into blocks
         let mut current_block_start = 0;
@@ -249,7 +259,7 @@ impl<'a> StaticSortedFileBuilder<'a> {
                     if current_block_size + value.len() > MAX_SMALL_VALUE_BLOCK_SIZE
                         || current_block_count + 1 >= MAX_SMALL_VALUE_BLOCK_ENTRIES
                     {
-                        let block_index = self.blocks.len();
+                        let block_index = self.blocks.len().try_into().unwrap();
                         let mut block = Vec::with_capacity(current_block_size);
                         for j in current_block_start..i {
                             if let EntryValue::Small { value } = &entries[j].value() {
@@ -262,12 +272,13 @@ impl<'a> StaticSortedFileBuilder<'a> {
                         current_block_size = 0;
                         current_block_count = 0;
                     }
-                    value_locations.push((0, current_block_size));
+                    value_locations.push((0, current_block_size.try_into().unwrap()));
                     current_block_size += value.len();
                     current_block_count += 1;
                 }
                 EntryValue::Medium { value } => {
-                    value_locations.push((self.blocks.len(), value.len()));
+                    let block_index = self.blocks.len().try_into().unwrap();
+                    value_locations.push((block_index, 0));
                     self.blocks.push(self.compress_value_block(value));
                 }
                 _ => {
@@ -276,7 +287,7 @@ impl<'a> StaticSortedFileBuilder<'a> {
             }
         }
         if current_block_count > 0 {
-            let block_index = self.blocks.len();
+            let block_index = self.blocks.len().try_into().unwrap();
             let mut block = Vec::with_capacity(current_block_size);
             for j in current_block_start..entries.len() {
                 if let EntryValue::Small { value } = &entries[j].value() {
@@ -292,20 +303,20 @@ impl<'a> StaticSortedFileBuilder<'a> {
         // Split the keys into blocks
         fn add_entry_to_block<E: Entry>(
             entry: &E,
-            value_location: &(usize, usize),
+            value_location: &(u16, u32),
             block: &mut KeyBlockBuilder,
         ) {
             match entry.value() {
                 EntryValue::Small { value } => {
                     block.put_small(
                         entry,
-                        value_location.0.try_into().unwrap(),
-                        value_location.1.try_into().unwrap(),
+                        value_location.0,
+                        value_location.1,
                         value.len().try_into().unwrap(),
                     );
                 }
                 EntryValue::Medium { .. } => {
-                    block.put_medium(entry, value_location.0.try_into().unwrap());
+                    block.put_medium(entry, value_location.0);
                 }
                 EntryValue::Large { blob } => {
                     block.put_blob(entry, blob);

@@ -3,14 +3,13 @@ import type {
   FlightRouterState,
   InitialRSCPayload,
   Segment as FlightRouterStateSegment,
-  DynamicParamTypesShort,
 } from './types'
 import type { ManifestNode } from '../../build/webpack/plugins/flight-manifest-plugin'
 
 // eslint-disable-next-line import/no-extraneous-dependencies
-import { createFromReadableStream } from 'react-server-dom-webpack/client.edge'
+import { createFromReadableStream } from 'react-server-dom-webpack/client'
 // eslint-disable-next-line import/no-extraneous-dependencies
-import { unstable_prerender as prerender } from 'react-server-dom-webpack/static.edge'
+import { unstable_prerender as prerender } from 'react-server-dom-webpack/static'
 
 import {
   streamFromBuffer,
@@ -64,6 +63,17 @@ export type SegmentPrefetch = {
   isPartial: boolean
 }
 
+const filterStackFrame =
+  process.env.NODE_ENV !== 'production'
+    ? (require('../lib/source-maps') as typeof import('../lib/source-maps'))
+        .filterStackFrameDEV
+    : undefined
+const findSourceMapURL =
+  process.env.NODE_ENV !== 'production'
+    ? (require('../lib/source-maps') as typeof import('../lib/source-maps'))
+        .findSourceMapURLDEV
+    : undefined
+
 function onSegmentPrerenderError(error: unknown) {
   const digest = getDigestForWellKnownError(error)
   if (digest) {
@@ -92,6 +102,7 @@ export async function collectSegmentData(
   //
   try {
     await createFromReadableStream(streamFromBuffer(fullPageDataBuffer), {
+      findSourceMapURL,
       serverConsumerManifest,
     })
     await waitAtLeastOneReactRenderTask()
@@ -128,6 +139,7 @@ export async function collectSegmentData(
     />,
     clientModules,
     {
+      filterStackFrame,
       signal: abortController.signal,
       onError: onSegmentPrerenderError,
     }
@@ -172,6 +184,7 @@ async function PrefetchTreeData({
   const initialRSCPayload: InitialRSCPayload = await createFromReadableStream(
     createUnclosingPrefetchStream(streamFromBuffer(fullPageDataBuffer)),
     {
+      findSourceMapURL,
       serverConsumerManifest,
     }
   )
@@ -295,7 +308,7 @@ function collectSegmentDataImpl(
 }
 
 function encodeSegmentWithPossibleFallbackParam(
-  segment: [string, string, DynamicParamTypesShort],
+  segment: Exclude<FlightRouterStateSegment, string>,
   fallbackRouteParams: FallbackRouteParams
 ): EncodedSegment {
   const name = segment[0]
@@ -349,6 +362,7 @@ async function renderSegmentPrefetch(
     segmentPrefetch,
     clientModules,
     {
+      filterStackFrame,
       signal: abortController.signal,
       onError: onSegmentPrerenderError,
     }
@@ -379,10 +393,11 @@ async function isPartialRSCData(
     abortController.abort()
   })
   await prerender(rsc, clientModules, {
+    filterStackFrame,
     signal: abortController.signal,
     onError() {},
     onPostpone() {
-      // If something postponed, i.e. when Dynamic IO is not enabled, we can
+      // If something postponed, i.e. when Cache Components is not enabled, we can
       // infer that the RSC data is partial.
       isPartial = true
     },
